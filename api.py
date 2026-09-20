@@ -762,6 +762,40 @@ class API:
             for provider in runtime_providers
         }
 
+    def _get_api_real_model_thinking_levels(self, provider: DriverProvider) -> dict[str, list[str]]:
+        try:
+            driver = self._get_driver_for_provider(provider)
+        except Exception:
+            return {}
+
+        getter = getattr(driver, "api_real_model_thinking_levels", None)
+        if not callable(getter):
+            return {}
+
+        try:
+            levels = getter()
+        except Exception as exc:
+            Logger.debug(f"{provider.value}: failed to read API thinking levels: {exc}")
+            return {}
+
+        out: dict[str, list[str]] = {}
+        for label, level_list in (levels or {}).items():
+            safe_label = str(label or "").strip()
+            if not safe_label:
+                continue
+            out[safe_label] = [str(l).strip().lower() for l in (level_list or []) if str(l).strip()]
+        return out
+
+    def _get_api_real_model_thinking_levels_by_provider(
+        self,
+        providers: list[DriverProvider] | None = None,
+    ) -> dict[DriverProvider, dict[str, list[str]]]:
+        runtime_providers = providers or list(self._drivers_by_provider.keys())
+        return {
+            provider: self._get_api_real_model_thinking_levels(provider)
+            for provider in runtime_providers
+        }
+
     def _get_request_queue_for_provider(self, provider: DriverProvider) -> RequestQueue:
         slots = self._get_execution_slots_for_provider(provider)
         if not slots:
@@ -1599,10 +1633,14 @@ class API:
                 real_model_labels_by_provider = self._get_api_real_model_labels_by_provider(
                     runtime_providers,
                 )
+                real_model_thinking_levels_by_provider = self._get_api_real_model_thinking_levels_by_provider(
+                    runtime_providers,
+                )
                 for provider, model_id in get_parallel_model_ids_for_providers(
                     runtime_providers,
                     cfg,
                     real_model_labels_by_provider=real_model_labels_by_provider,
+                    real_model_thinking_levels_by_provider=real_model_thinking_levels_by_provider,
                 ):
                     model_data.extend(
                         build_openai_model_list(
@@ -1620,6 +1658,7 @@ class API:
                 effective_provider,
                 cfg,
                 real_model_labels=self._get_api_real_model_labels(effective_provider),
+                real_model_thinking_levels=self._get_api_real_model_thinking_levels(effective_provider),
             )
 
             return {

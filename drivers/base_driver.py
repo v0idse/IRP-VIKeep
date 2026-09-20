@@ -1336,6 +1336,14 @@ class BaseDriver(ABC):
         """Return real provider model labels that can be exposed as API model IDs."""
         return []
 
+    def api_real_model_thinking_levels(self) -> dict[str, list[str]]:
+        """Map friendly model label -> supported thinking levels (lowercase).
+
+        Providers with per-request thinking intensity (GLM, Kimi) override this
+        so the API can expose `<model>-reasoning-<level>` IDs.
+        """
+        return {}
+
     def validate_explicit_request_model_available(self, model: Any = None) -> None:
         """Raise if the explicit API model ID names a known but unavailable model."""
         _ = model

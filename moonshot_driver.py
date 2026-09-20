@@ -28,7 +28,12 @@ from drivers.shared_utils import (
 )
 from utils.cache_manager import CacheManager
 from utils.logger import Logger
-from utils.model_ids import MODE_CHAT, MODE_REASONER, resolve_behavior_mode
+from utils.model_ids import (
+    MODE_CHAT,
+    MODE_REASONER,
+    resolve_behavior_mode,
+    resolve_thinking_level_from_model_id,
+)
 
 load_dotenv()
 
@@ -43,8 +48,8 @@ class MoonshotDriver(BaseDriver):
         "/apiv2/kimi.gateway.chat.v1.ChatService/RegenerateMessage",
     )
     USER_SETTINGS_ROUTE_GLOB = "**/apiv2/kimi.usersetting.v1.UserSettingService/GetUserSetting*"
-    USER_SETTINGS_UPDATE_URL = "https://www.kimi.com/apiv2/kimi.usersetting.v1.UserSettingService/UpdateUserSetting"
-    NEW_CHAT_URL = "https://www.kimi.com/?chat_enter_method=new_chat"
+    USER_SETTINGS_UPDATE_URL = "https://www.kimi.ai/apiv2/kimi.usersetting.v1.UserSettingService/UpdateUserSetting"
+    NEW_CHAT_URL = "https://www.kimi.ai/?chat_enter_method=new_chat"
     AUTH_HOST_MARKER = "accounts.google.com"
     MEMORY_DISABLE_UPDATE_PAYLOAD = {
         "user_setting": {"memory": {}},
@@ -63,8 +68,29 @@ class MoonshotDriver(BaseDriver):
         "x-traffic-id",
     }
     CONNECT_MAX_FRAME_BYTES = 8 * 1024 * 1024
-    MODEL_INSTANT = "K2.6 Instant"
-    MODEL_THINKING = "K2.6 Thinking"
+    # Current Kimi models
+    MODEL_INSTANT_FRIENDLY = "Instant"
+    MODEL_K28_FRIENDLY = "K2.8"
+    MODEL_K3_SWARM_FRIENDLY = "K3 Swarm"
+    MODEL_K3_FRIENDLY = "K3"
+
+    MODEL_DATA_VALUE_BY_FRIENDLY: Dict[str, str] = {
+        "K3": "K3",
+        "K3 Swarm": "K3 Swarm",
+        "K2.8": "K2.8",
+        "Instant": "Instant",
+    }
+
+    MODEL_FAMILY_BY_FRIENDLY: Dict[str, str] = {
+        "K3": "agent",
+        "K3 Swarm": "swarm",
+        "K2.8": "agent",
+        "Instant": "plain-chat",
+    }
+
+    THINKING_LEVELS_AGENT = ["Standard", "High", "Max"]
+    THINKING_LEVELS_PLAIN_CHAT = ["Standard", "High"]
+    DEFAULT_THINKING_LEVEL = "High"
     MODEL_CHAT_API = "moonshot-chat"
     MODEL_REASONER_API = "moonshot-reasoner"
     INTERCEPT_FIRST_CHUNK_TIMEOUT_S = 45.0
@@ -116,7 +142,61 @@ class MoonshotDriver(BaseDriver):
         self._last_followup_request_headers: Dict[str, str] = {}
 
     def get_start_url(self) -> str:
-        return "https://www.kimi.com/"
+        return "https://www.kimi.ai/"
+
+    def api_real_model_labels(self) -> list[str]:
+        return list(self.MODEL_DATA_VALUE_BY_FRIENDLY.keys())
+
+    def api_real_model_thinking_levels(self) -> dict[str, list[str]]:
+        out: dict[str, list[str]] = {}
+        for friendly in self.MODEL_DATA_VALUE_BY_FRIENDLY:
+            levels = self._get_thinking_levels_for_model(friendly)
+            out[friendly] = [str(l).lower() for l in levels]
+        return out
+
+    def _get_configured_model_friendly(self) -> str:
+        try:
+            value = self.config_manager.get_setting("moonshot_behavior", "model")
+        except Exception:
+            value = None
+        return str(value or "").strip() or self.MODEL_K3_FRIENDLY
+
+    def _get_configured_thinking_level(self) -> str:
+        try:
+            value = self.config_manager.get_setting("moonshot_behavior", "thinking_level")
+        except Exception:
+            value = None
+        level = str(value or "").strip()
+        return level if level in {"Standard", "High", "Max"} else self.DEFAULT_THINKING_LEVEL
+
+    def _get_thinking_levels_for_model(self, model_friendly: str) -> list[str]:
+        family = self.MODEL_FAMILY_BY_FRIENDLY.get(str(model_friendly or "").strip(), "")
+        if family == "plain-chat":
+            return self.THINKING_LEVELS_PLAIN_CHAT
+        return self.THINKING_LEVELS_AGENT
+
+    @staticmethod
+    def _normalize_thinking_level(value: str) -> str:
+        v = str(value or "").strip().lower()
+        if v in {"standard", "std", "normal", "low", "minimum", "min"}:
+            return "Standard"
+        if v in {"high", "advanced", "adv", "medium", "med"}:
+            return "High"
+        if v in {"max", "maximum", "deep", "xhigh", "x-high", "highest"}:
+            return "Max"
+        return MoonshotDriver.DEFAULT_THINKING_LEVEL
+
+    async def apply_configured_model(self, model: Any = None, wait_until_ready: bool = False) -> None:
+        await self._dismiss_kimi_sidebar_overlay()
+        desired = self._get_configured_model_friendly()
+        if not desired:
+            return
+        if not wait_until_ready:
+            return
+        current = await self._read_current_model_name()
+        if self._normalize_text(current) == self._normalize_text(desired):
+            return
+        await self._select_kimi_model(desired)
 
     async def before_initial_navigation(self) -> None:
         if not self.page:
@@ -339,7 +419,7 @@ class MoonshotDriver(BaseDriver):
                                 const resp = await fetch(request.url, {
                                     method: request.method || "POST",
                                     credentials: "include",
-                                    referrer: request.referrer || "https://www.kimi.com/settings",
+                                    referrer: request.referrer || "https://www.kimi.ai/settings",
                                     headers: {
                                         ...(request.headers || {}),
                                         "content-type": "application/json",
@@ -1324,28 +1404,44 @@ class MoonshotDriver(BaseDriver):
         self._mark_active_ece_pair_used()
 
     def _resolve_deepthink_flags(self, model: str) -> tuple[bool, bool]:
-        enable_deepthink = bool(self.config_manager.get_setting("moonshot_behavior", "enable_deepthink"))
+        """Resolve thinking flags. All current Kimi models have thinking always on.
+        'enable_deepthink' now means: use High/Max instead of Standard.
+        """
         send_deepthink = bool(self.config_manager.get_setting("moonshot_behavior", "send_deepthink"))
+        thinking_level = self._get_configured_thinking_level()
 
-        mode = resolve_behavior_mode(model, self.provider)
+        mode = resolve_behavior_mode(
+            model,
+            self.provider,
+            real_model_labels=self.api_real_model_labels(),
+        )
         if mode == MODE_CHAT:
             return False, False
         if mode == MODE_REASONER:
             return True, send_deepthink
 
+        enable_deepthink = thinking_level != "Standard"
         return enable_deepthink, send_deepthink
 
     def _resolve_moonshot_request_settings(self, model: str, overrides: Optional[Dict[str, bool]] = None) -> Dict[str, bool]:
-        _ = (model or "").strip() or "moonshot-auto"
-        deepthink_enabled, send_deepthink = self._resolve_deepthink_flags(model)
+        resolved_model = (model or "").strip() or "moonshot-auto"
+        deepthink_enabled, send_deepthink = self._resolve_deepthink_flags(resolved_model)
         search_enabled = bool(self.config_manager.get_setting("moonshot_behavior", "enable_search"))
         send_as_text_file = bool(self.config_manager.get_setting("moonshot_behavior", "send_as_text_file"))
+
+        # A '-reasoning-<level>' model ID pins the thinking level directly.
+        thinking_level = self._get_configured_thinking_level()
+        level_from_id = resolve_thinking_level_from_model_id(resolved_model)
+        if level_from_id:
+            thinking_level = self._normalize_thinking_level(level_from_id)
+            deepthink_enabled = True
 
         settings = {
             "deepthink_enabled": bool(deepthink_enabled),
             "send_deepthink": bool(send_deepthink),
             "search_enabled": bool(search_enabled),
             "send_as_text_file": bool(send_as_text_file),
+            "thinking_level": thinking_level,
         }
 
         if overrides:
@@ -1428,7 +1524,7 @@ class MoonshotDriver(BaseDriver):
             return None
 
         hostname = str(parsed.netloc or "").strip().lower()
-        if hostname not in {"www.kimi.com", "kimi.com"}:
+        if hostname not in {"www.kimi.ai", "kimi.ai"}:
             return None
 
         path_parts = [part for part in str(parsed.path or "").split("/") if part]
@@ -1441,7 +1537,7 @@ class MoonshotDriver(BaseDriver):
 
         return {
             "conversation_id": conversation_id,
-            "conversation_url": f"https://www.kimi.com/chat/{conversation_id}",
+            "conversation_url": f"https://www.kimi.ai/chat/{conversation_id}",
         }
 
     async def _get_current_conversation_info(self) -> Optional[Dict[str, str]]:
@@ -1488,13 +1584,13 @@ class MoonshotDriver(BaseDriver):
         headers = dict(getattr(self, "_last_followup_request_headers", {}) or {})
         headers.setdefault("accept", "application/json, text/plain, */*")
         headers.setdefault("content-type", "application/json")
-        headers.setdefault("origin", "https://www.kimi.com")
-        headers.setdefault("referer", "https://www.kimi.com/")
+        headers.setdefault("origin", "https://www.kimi.ai")
+        headers.setdefault("referer", "https://www.kimi.ai/")
 
         try:
             client = await self._get_http_client()
             response = await client.post(
-                "https://www.kimi.com/apiv2/kimi.chat.v1.ChatService/DeleteChat",
+                "https://www.kimi.ai/apiv2/kimi.chat.v1.ChatService/DeleteChat",
                 headers=headers,
                 cookies=cookies,
                 json={"chat_id": normalized_id},
@@ -2590,81 +2686,87 @@ class MoonshotDriver(BaseDriver):
                 )
 
     async def _read_current_model_name(self) -> str:
-        selectors = [
-            "div.current-model div.model-name > span:first-child",
-            "div.current-model div.model-name span:first-child",
-            "div.current-model div.model-name span.name",
-            "div.current-model span.name",
-            "div.current-model .name",
-        ]
+        """Read the currently selected model name from the new Kimi UI."""
+        try:
+            name = await self.page.evaluate(
+                "() => {"
+                "  const t = document.querySelector('#v-0-1-menu-trigger');"
+                "  if (!t) return '';"
+                "  const s = t.querySelector('span.name');"
+                "  return s ? (s.textContent || '').trim() : '';"
+                "}"
+            )
+            if name:
+                return str(name).strip()
+        except Exception:
+            pass
 
-        for selector in selectors:
-            try:
-                locator = self.page.locator(selector)
-                if await locator.count() == 0:
-                    continue
-                text = (await locator.first.inner_text() or "").strip()
-                if text:
-                    return text
-            except Exception:
-                continue
+        try:
+            name = await self.page.evaluate(
+                "() => {"
+                "  const c = document.querySelector("
+                '    \'[data-testid="model-option"].checked span.name\''
+                "  );"
+                "  return c ? (c.textContent || '').trim() : '';"
+                "}"
+            )
+            if name:
+                return str(name).strip()
+        except Exception:
+            pass
 
         return ""
 
     async def _read_kimi_model_item_name(self, item) -> str:
-        selectors = [
-            "div.model-item-content div.header div.model-name > span:first-child",
-            "div.model-item-content div.header div.model-name span:first-child",
-            "div.model-name > span:first-child",
-            "div.model-name span:first-child",
-            "span.name",
-        ]
-
-        for selector in selectors:
-            try:
-                locator = item.locator(selector)
-                if await locator.count() == 0:
-                    continue
-                text = (await locator.first.inner_text() or "").strip()
-                if text:
-                    return text
-            except Exception:
-                continue
+        """Read model name from a menuitemradio in the new Kimi UI."""
+        try:
+            name = await item.evaluate(
+                "el => {"
+                "  const s = el.querySelector('span.name');"
+                "  return s ? (s.textContent || '').trim() : '';"
+                "}"
+            )
+            if name:
+                return str(name).strip()
+        except Exception:
+            pass
 
         try:
             raw = (await item.inner_text() or "").strip()
+            if raw:
+                for line in raw.splitlines():
+                    text = line.strip()
+                    if text and len(text) < 60:
+                        return text
         except Exception:
-            raw = ""
-        if not raw:
-            return ""
+            pass
 
-        for line in raw.splitlines():
-            text = line.strip()
-            if text:
-                return text
-        return raw
+        return ""
 
     async def _select_kimi_model(self, target_model: str) -> bool:
+        """Select a model in the new Kimi UI using menuitemradio items."""
         await self._dismiss_kimi_sidebar_overlay()
-        trigger = await self._find_first_visible(["div.current-model"], timeout_ms=8000)
+        trigger = await self._find_first_visible(
+            ["#v-0-1-menu-trigger", "div.current-model"], timeout_ms=8000
+        )
         if trigger is None:
             Logger.warning("Moonshot: model selector trigger not found.")
             return False
 
         try:
-            if await self._find_first_visible(["div.models-container"], timeout_ms=0) is None:
-                clicked = await self._click_with_fallbacks(trigger, timeout_ms=3000)
-                if not clicked:
-                    Logger.warning("Moonshot: model selector trigger could not be clicked.")
-                    return False
-            await self.page.wait_for_selector("div.models-container", timeout=5000, state="visible")
-            await self.page.wait_for_selector("div.models-container div.model-item", timeout=5000, state="attached")
+            clicked = await self._click_with_fallbacks(trigger, timeout_ms=3000)
+            if not clicked:
+                Logger.warning("Moonshot: model selector trigger could not be clicked.")
+                return False
+            await self.page.wait_for_selector(
+                '[data-testid="model-option"]', timeout=5000, state="visible"
+            )
         except Exception as e:
             Logger.warning(f"Moonshot: model picker did not open: {e}")
             return False
 
         target_norm = self._normalize_text(target_model)
-        items = self.page.locator("div.models-container div.model-item")
+        items = self.page.locator('[data-testid="model-option"]')
         count = await items.count()
         if count == 0:
             Logger.warning("Moonshot: no model items found in picker.")
@@ -2706,25 +2808,74 @@ class MoonshotDriver(BaseDriver):
         return False
 
     async def set_deepthink_state(self, state: bool):
-        current = await self._read_current_model_name()
-        current_norm = self._normalize_text(current)
-        instant_norm = self._normalize_text(self.MODEL_INSTANT)
-        thinking_norm = self._normalize_text(self.MODEL_THINKING)
+        """Set the thinking intensity level. All Kimi models now always have thinking.
+        'state' is kept for backward compat: True = use configured level, False = Standard.
+        """
+        model_friendly = self._get_configured_model_friendly()
+        desired_level = self._get_configured_thinking_level()
 
-        target_model = self.MODEL_THINKING if state else self.MODEL_INSTANT
-        target_norm = self._normalize_text(target_model)
+        if not state:
+            desired_level = "Standard"
+        elif state and desired_level == "Standard":
+            desired_level = "High"
 
-        if current_norm == target_norm:
+        await self._set_thinking_intensity(desired_level, model_friendly)
+
+    async def _set_thinking_intensity(self, level: str, model_friendly: str = "") -> None:
+        """Open the thinking intensity submenu and select the desired level."""
+        if not self.page:
             return
 
-        if (current_norm not in {instant_norm, thinking_norm}) and (not state):
-            target_model = self.MODEL_INSTANT
+        await self._dismiss_kimi_sidebar_overlay()
+        mf = model_friendly or self._get_configured_model_friendly()
+        available = self._get_thinking_levels_for_model(mf)
+        desired = self._normalize_thinking_level(level)
+        if desired not in available:
+            desired = available[-1]
 
-        switched = await self._select_kimi_model(target_model)
-        if not switched:
-            Logger.warning(
-                f"Moonshot: failed to set Thinking mode target model '{target_model}'."
+        trigger = await self._find_first_visible(
+            ["#v-0-1-menu-trigger", "div.current-model"], timeout_ms=5000
+        )
+        if trigger is None:
+            return
+
+        try:
+            await self._click_with_fallbacks(trigger, timeout_ms=3000)
+            await self.page.wait_for_selector(
+                '[data-testid="model-effort-item"]', timeout=5000, state="visible"
             )
+        except Exception:
+            return
+
+        try:
+            effort_btn = self.page.locator('[data-testid="model-effort-item"]')
+            if await effort_btn.count() > 0:
+                await effort_btn.first.click(timeout=3000)
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            Logger.debug(f"Moonshot: failed to open thinking submenu: {e}")
+            return
+
+        try:
+            level_items = self.page.locator('[role="menuitemradio"]')
+            count = await level_items.count()
+            for idx in range(min(count, 10)):
+                item = level_items.nth(idx)
+                try:
+                    text = (await item.inner_text() or "").strip()
+                    if self._normalize_thinking_level(text) == desired:
+                        await item.click(timeout=3000)
+                        Logger.debug(f"Moonshot: thinking set to '{desired}'")
+                        return
+                except Exception:
+                    continue
+        except Exception as e:
+            Logger.debug(f"Moonshot: failed to select thinking level: {e}")
+
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
 
     async def _is_search_enabled(self) -> bool:
         indicator = self.page.locator(

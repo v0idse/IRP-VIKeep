@@ -19,6 +19,7 @@ REAL_MODEL_SUFFIX_MODE_BY_SUFFIX: tuple[tuple[str, str], ...] = (
 
 REAL_MODEL_ID_PROVIDERS: set[DriverProvider] = {
     DriverProvider.GLM_CHAT,
+    DriverProvider.MOONSHOT,
     DriverProvider.QWEN_LM,
     DriverProvider.PERPLEXITY,
     DriverProvider.HUGGINGCHAT,
@@ -121,6 +122,33 @@ OWNED_BY_PROVIDER: Dict[DriverProvider, str] = {
 }
 
 AISTUDIO_MODEL_OVERRIDE_SUFFIX_RE = re.compile(r"-(minimal|low|medium|high|r[0-4])$")
+
+# Thinking-level-aware model IDs: `<base>-reasoning-<level>` (and the
+# `-thinking-<level>` alias). The level is provider-specific (e.g. GLM uses
+# low/high/max, Kimi uses standard/high/max). These IDs force reasoning ON at a
+# specific thinking intensity, overriding the configured default.
+REASONING_LEVEL_SUFFIX_RE = re.compile(r"-(?:reasoning|thinking)-([a-z0-9]+)$")
+REASONING_LEVEL_TAG = "reasoning"
+
+
+def resolve_thinking_level_from_model_id(model: Any) -> str | None:
+    """Extract the thinking level from a '-reasoning-<level>' (or '-thinking-<level>') suffix.
+
+    Returns the level name (lowercase) or None if the model ID has no such suffix.
+    """
+    normalized = str(model or "").strip().lower()
+    if not normalized:
+        return None
+    match = REASONING_LEVEL_SUFFIX_RE.search(normalized)
+    if not match:
+        return None
+    return match.group(1)
+
+
+def strip_thinking_level_suffix(model: Any) -> str:
+    """Normalize a '-reasoning-<level>' ID down to its '-reasoner' equivalent."""
+    normalized = str(model or "").strip().lower()
+    return REASONING_LEVEL_SUFFIX_RE.sub("-reasoner", normalized)
 
 
 def get_legacy_model_ids(provider: DriverProvider) -> list[str]:
@@ -244,8 +272,25 @@ def _real_model_mode_map(
     return mode_map
 
 
-def get_real_model_ids_for_labels(real_model_labels: Iterable[str] | None) -> list[str]:
-    return list(_real_model_label_map(real_model_labels).keys())
+def get_real_model_ids_for_labels(
+    real_model_labels: Iterable[str] | None,
+    *,
+    real_model_thinking_levels: Mapping[str, Iterable[str]] | None = None,
+) -> list[str]:
+    out = list(_real_model_label_map(real_model_labels).keys())
+    levels_map = real_model_thinking_levels or {}
+    seen: set[str] = set(out)
+    for raw_label in real_model_labels or ():
+        label = str(raw_label or "").strip()
+        base_id = normalize_real_model_api_base(label)
+        if not label or not base_id:
+            continue
+        for level in levels_map.get(label) or ():
+            rid = f"{base_id}-{REASONING_LEVEL_TAG}-{str(level).strip().lower()}"
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+    return out
 
 
 def get_real_model_ids_for_provider(
@@ -254,10 +299,12 @@ def get_real_model_ids_for_provider(
     *,
     include_provider_prefix: bool = False,
     prefixed_model_ids: Iterable[str] | None = None,
+    real_model_thinking_levels: Mapping[str, Iterable[str]] | None = None,
 ) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
     ids_to_prefix = set(prefixed_model_ids or ())
+    levels_map = real_model_thinking_levels or {}
 
     for raw_label in real_model_labels or ():
         label = str(raw_label or "").strip()
@@ -272,6 +319,15 @@ def get_real_model_ids_for_provider(
                 output_base_id = _with_real_model_api_prefix(provider, base_id)
 
             model_id = f"{output_base_id}{suffix}"
+            if model_id not in seen:
+                seen.add(model_id)
+                out.append(model_id)
+
+        for level in levels_map.get(label) or ():
+            output_base_id = base_id
+            if include_provider_prefix:
+                output_base_id = _with_real_model_api_prefix(provider, base_id)
+            model_id = f"{output_base_id}-{REASONING_LEVEL_TAG}-{str(level).strip().lower()}"
             if model_id not in seen:
                 seen.add(model_id)
                 out.append(model_id)
@@ -345,6 +401,7 @@ def _get_parallel_model_ids_for_providers_impl(
     config_manager: Any,
     *,
     real_model_labels_by_provider: Mapping[DriverProvider, Iterable[str]] | None = None,
+    real_model_thinking_levels_by_provider: Mapping[DriverProvider, Mapping[str, Iterable[str]]] | None = None,
 ) -> list[tuple[DriverProvider, str]]:
     provider_list = list(providers)
     items: list[tuple[DriverProvider, str]] = []
@@ -365,10 +422,14 @@ def _get_parallel_model_ids_for_providers_impl(
         labels = None
         if real_model_labels_by_provider:
             labels = real_model_labels_by_provider.get(provider)
+        levels = None
+        if real_model_thinking_levels_by_provider:
+            levels = real_model_thinking_levels_by_provider.get(provider)
         real_model_ids = get_real_model_ids_for_provider(
             provider,
             labels,
             prefixed_model_ids=prefixed_model_ids,
+            real_model_thinking_levels=levels,
         )
         items.extend((provider, model_id) for model_id in real_model_ids)
 
@@ -380,11 +441,13 @@ def get_parallel_model_ids_for_providers(
     config_manager: Any,
     *,
     real_model_labels_by_provider: Mapping[DriverProvider, Iterable[str]] | None = None,
+    real_model_thinking_levels_by_provider: Mapping[DriverProvider, Mapping[str, Iterable[str]]] | None = None,
 ) -> list[tuple[DriverProvider, str]]:
     return _get_parallel_model_ids_for_providers_impl(
         providers,
         config_manager,
         real_model_labels_by_provider=real_model_labels_by_provider,
+        real_model_thinking_levels_by_provider=real_model_thinking_levels_by_provider,
     )
 
 
@@ -395,13 +458,16 @@ def resolve_parallel_provider_from_model_id(
     *,
     real_model_labels_by_provider: Mapping[DriverProvider, Iterable[str]] | None = None,
 ) -> DriverProvider | None:
+    # A '-reasoning-<level>' ID routes to the same provider as its '-reasoner'
+    # base; the level only affects thinking intensity, not provider routing.
+    normalized = strip_thinking_level_suffix(model)
     matches = _providers_for_model_id(
         _get_parallel_model_ids_for_providers_impl(
             providers,
             config_manager,
             real_model_labels_by_provider=real_model_labels_by_provider,
         ),
-        model,
+        normalized,
     )
     if len(matches) == 1:
         return next(iter(matches))
@@ -421,6 +487,8 @@ def resolve_real_model_label_from_model_id(
 
     if provider == DriverProvider.AI_STUDIO:
         normalized = _strip_aistudio_override_suffix(normalized)
+    else:
+        normalized = strip_thinking_level_suffix(normalized)
 
     return _real_model_label_map(
         real_model_labels,
@@ -436,13 +504,19 @@ def get_model_ids_for_provider(
     *,
     force_legacy: bool = False,
     real_model_labels: Iterable[str] | None = None,
+    real_model_thinking_levels: Mapping[str, Iterable[str]] | None = None,
 ) -> list[str]:
     if (not force_legacy) and is_umm_enabled(config_manager):
         model_ids = list(UMM_MODEL_IDS)
         if provider == DriverProvider.DEEPSEEK:
             model_ids.extend(DEEPSEEK_UMM_EXPERT_MODEL_IDS)
         if provider in REAL_MODEL_ID_PROVIDERS:
-            model_ids.extend(get_real_model_ids_for_labels(real_model_labels))
+            model_ids.extend(
+                get_real_model_ids_for_labels(
+                    real_model_labels,
+                    real_model_thinking_levels=real_model_thinking_levels,
+                )
+            )
         return model_ids
     return get_legacy_model_ids(provider)
 
@@ -453,17 +527,22 @@ def get_model_ids_for_providers(
     *,
     force_legacy: bool = False,
     real_model_labels_by_provider: Mapping[DriverProvider, Iterable[str]] | None = None,
+    real_model_thinking_levels_by_provider: Mapping[DriverProvider, Mapping[str, Iterable[str]]] | None = None,
 ) -> list[tuple[DriverProvider, str]]:
     items: list[tuple[DriverProvider, str]] = []
     for provider in providers:
         real_model_labels = None
         if real_model_labels_by_provider:
             real_model_labels = real_model_labels_by_provider.get(provider)
+        real_model_thinking_levels = None
+        if real_model_thinking_levels_by_provider:
+            real_model_thinking_levels = real_model_thinking_levels_by_provider.get(provider)
         model_ids = get_model_ids_for_provider(
             provider,
             config_manager,
             force_legacy=force_legacy,
             real_model_labels=real_model_labels,
+            real_model_thinking_levels=real_model_thinking_levels,
         )
         items.extend((provider, model_id) for model_id in model_ids)
     return items
@@ -492,6 +571,8 @@ def is_supported_model_id(
         real_normalized = normalized
         if provider == DriverProvider.AI_STUDIO:
             real_normalized = _strip_aistudio_override_suffix(real_normalized)
+        else:
+            real_normalized = strip_thinking_level_suffix(real_normalized)
         if real_normalized in _real_model_mode_map(
             real_model_labels,
             provider=provider,
@@ -570,6 +651,8 @@ def resolve_behavior_mode(
     real_normalized = normalized
     if provider == DriverProvider.AI_STUDIO:
         real_normalized = _strip_aistudio_override_suffix(real_normalized)
+    else:
+        real_normalized = strip_thinking_level_suffix(real_normalized)
     real_model_mode = _real_model_mode_map(
         real_model_labels,
         provider=provider,

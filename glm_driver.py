@@ -34,6 +34,7 @@ from utils.model_ids import (
     MODE_REASONER,
     resolve_behavior_mode,
     resolve_real_model_label_from_model_id,
+    resolve_thinking_level_from_model_id,
 )
 
 load_dotenv()
@@ -41,14 +42,6 @@ load_dotenv()
 
 GLM_REQUEST_MACRO_ACTIONS: Dict[str, tuple[str, Any]] = {
     **COMMON_REQUEST_MACRO_ACTIONS,
-    "tool": ("tools_enabled", True),
-    "tools": ("tools_enabled", True),
-    "notool": ("tools_enabled", False),
-    "no_tool": ("tools_enabled", False),
-    "no-tool": ("tools_enabled", False),
-    "notools": ("tools_enabled", False),
-    "no_tools": ("tools_enabled", False),
-    "no-tools": ("tools_enabled", False),
 }
 
 
@@ -62,7 +55,6 @@ class GLMDriver(BaseDriver):
     COMPLETION_URL_PATHS = {"/api/v2/chat/completions"}
     MODEL_CONCURRENCY_LIMIT_CODE = "MODEL_CONCURRENCY_LIMIT"
     GLM_52_MODEL_FRIENDLY = "GLM-5.2"
-    TOOLS_SUPPORTED_MODEL_FRIENDLY = "GLM-5V-Turbo"
     DEFAULT_GLM_52_DEEPTHINK_EFFORT = "max"
     MODEL_CAPACITY_TEXT_MARKERS = (
         "model_concurrency_limit",
@@ -82,7 +74,6 @@ class GLMDriver(BaseDriver):
         "deepthink_effort",
         "search_enabled",
         "advanced_search_enabled",
-        "tools_enabled",
         "send_as_text_file",
         "ui_model",
     )
@@ -96,11 +87,9 @@ class GLMDriver(BaseDriver):
     MODEL_DROPDOWN_SELECTOR = f"div#{MODEL_DROPDOWN_ID}"
     MODEL_OPTION_SELECTOR = "button[aria-label='model-item'][data-value], div[role='menu'] button[data-value]"
     MODEL_DATA_VALUE_BY_FRIENDLY: Dict[str, str] = {
+        "GLM-5.3-Flash": "x-preview-l",
+        "GLM-5.3": "glm-5.3",
         "GLM-5.2": "glm-5.2",
-        "GLM-5.1": "GLM-5.1",
-        "GLM-5-Turbo": "GLM-5-Turbo",
-        "GLM-5V-Turbo": "GLM-5v-Turbo",
-        "GLM-4.7": "glm-4.7",
     }
 
     # Models hidden behind a collapsible section in older dropdown variants.
@@ -317,6 +306,17 @@ class GLMDriver(BaseDriver):
     def api_real_model_labels(self) -> list[str]:
         return list(self.MODEL_DATA_VALUE_BY_FRIENDLY.keys())
 
+    # Per-model Deep Think effort levels (lowercase for API IDs).
+    # GLM-5.2 supports High/Max; GLM-5.3 and GLM-5.3-Flash add Low.
+    GLM_THINKING_LEVELS_BY_FRIENDLY: dict[str, list[str]] = {
+        "GLM-5.2": ["high", "max"],
+        "GLM-5.3": ["low", "high", "max"],
+        "GLM-5.3-Flash": ["low", "high", "max"],
+    }
+
+    def api_real_model_thinking_levels(self) -> dict[str, list[str]]:
+        return dict(self.GLM_THINKING_LEVELS_BY_FRIENDLY)
+
     def _get_glm_model_label_for_request(self, model: Any = None) -> str:
         override = resolve_real_model_label_from_model_id(
             self.provider,
@@ -365,11 +365,14 @@ class GLMDriver(BaseDriver):
     def _normalize_model_label(value: str) -> str:
         return re.sub(r"\\s+", " ", str(value or "")).strip().lower()
 
+    # All current GLM models (5.2, 5.3, 5.3-Flash) support Deep Think effort controls.
+    GLM_DEEPTHINK_EFFORT_MODELS: set[str] = {"GLM-5.2", "GLM-5.3", "GLM-5.3-Flash"}
+
     @classmethod
     def _glm_uses_deepthink_effort_controls(cls, model_friendly: str) -> bool:
-        return cls._normalize_model_label(model_friendly) == cls._normalize_model_label(
-            cls.GLM_52_MODEL_FRIENDLY
-        )
+        return cls._normalize_model_label(model_friendly) in {
+            cls._normalize_model_label(m) for m in cls.GLM_DEEPTHINK_EFFORT_MODELS
+        }
 
     @classmethod
     def _normalize_glm_deepthink_effort(cls, value: Any, default: str | None = None) -> str:
@@ -382,7 +385,9 @@ class GLMDriver(BaseDriver):
             return "max"
         if normalized in {"high", "medium", "med"}:
             return "high"
-        return fallback if fallback in {"high", "max"} else cls.DEFAULT_GLM_52_DEEPTHINK_EFFORT
+        if normalized in {"low", "minimum", "min", "xlow", "x-low"}:
+            return "low"
+        return fallback if fallback in {"high", "max", "low"} else cls.DEFAULT_GLM_52_DEEPTHINK_EFFORT
 
     def _get_request_capture_mode(self) -> str:
         try:
@@ -1232,6 +1237,17 @@ class GLMDriver(BaseDriver):
 
         self.ece_mark_used(email)
 
+    # GLM-5.3 family models force Deep Think ON (no chat-only mode available)
+    GLM_53_FAMILY_MODELS = {"GLM-5.3", "GLM-5.3-Flash"}
+
+    def _is_glm_53_family_model(self, model: str) -> bool:
+        label = resolve_real_model_label_from_model_id(
+            self.provider,
+            model,
+            self.api_real_model_labels(),
+        )
+        return (label or "").strip() in self.GLM_53_FAMILY_MODELS
+
     def _resolve_deepthink_flags(self, model: str) -> tuple[bool, bool]:
         enable_deepthink = bool(self.config_manager.get_setting("glm_behavior", "enable_deepthink"))
         send_deepthink = bool(self.config_manager.get_setting("glm_behavior", "send_deepthink"))
@@ -1241,6 +1257,10 @@ class GLMDriver(BaseDriver):
             self.provider,
             real_model_labels=self.api_real_model_labels(),
         )
+        # GLM-5.3 family forces Deep Think ON regardless of mode
+        if self._is_glm_53_family_model(model):
+            return True, send_deepthink
+
         if mode == MODE_CHAT:
             return False, False
         if mode == MODE_REASONER:
@@ -1248,10 +1268,6 @@ class GLMDriver(BaseDriver):
 
         return enable_deepthink, send_deepthink
 
-    def _glm_tools_supported_for_model(self, model_friendly: str) -> bool:
-        return self._normalize_model_label(model_friendly) == self._normalize_model_label(
-            self.TOOLS_SUPPORTED_MODEL_FRIENDLY
-        )
 
     def _resolve_glm_deepthink_effort(
         self,
@@ -1269,6 +1285,13 @@ class GLMDriver(BaseDriver):
 
     def _resolve_glm_request_settings(self, model: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         resolved_model = (model or "").strip() or "glm-auto"
+        overrides = dict(overrides or {})
+
+        # A '-reasoning-<level>' model ID pins the Deep Think effort directly.
+        level_from_id = resolve_thinking_level_from_model_id(resolved_model)
+        if level_from_id:
+            overrides["deepthink_effort"] = level_from_id
+
         ui_model_label = self._get_glm_model_label_for_request(resolved_model)
         deepthink_enabled, send_deepthink = self._resolve_deepthink_flags(resolved_model)
         deepthink_effort = self._resolve_glm_deepthink_effort(
@@ -1280,9 +1303,7 @@ class GLMDriver(BaseDriver):
         enable_advanced_search = bool(
             self.config_manager.get_setting("glm_behavior", "enable_advanced_search")
         )
-        enable_tools = bool(self.config_manager.get_setting("glm_behavior", "enable_tools"))
         send_as_text_file = bool(self.config_manager.get_setting("glm_behavior", "send_as_text_file"))
-        tools_supported = self._glm_tools_supported_for_model(ui_model_label)
 
         settings = {
             "model_label": ui_model_label,
@@ -1291,7 +1312,6 @@ class GLMDriver(BaseDriver):
             "send_deepthink": bool(send_deepthink),
             "search_enabled": bool(enable_search),
             "advanced_search_enabled": bool(enable_advanced_search),
-            "tools_enabled": bool(enable_tools),
             "send_as_text_file": bool(send_as_text_file),
         }
 
@@ -1302,7 +1322,6 @@ class GLMDriver(BaseDriver):
                 "deepthink_effort",
                 "search_enabled",
                 "advanced_search_enabled",
-                "tools_enabled",
                 "send_as_text_file",
             ):
                 if key == "deepthink_effort":
@@ -1316,8 +1335,6 @@ class GLMDriver(BaseDriver):
                 if key in overrides:
                     settings[key] = bool(overrides[key])
 
-        if not tools_supported:
-            settings["tools_enabled"] = False
         if settings["deepthink_enabled"] and self._glm_uses_deepthink_effort_controls(ui_model_label):
             if not settings["deepthink_effort"]:
                 settings["deepthink_effort"] = self._get_configured_glm_deepthink_effort()
@@ -1386,7 +1403,6 @@ class GLMDriver(BaseDriver):
             "deepthink_effort": deepthink_effort,
             "search_enabled": bool(state.get("search_enabled")),
             "advanced_search_enabled": bool(state.get("advanced_search_enabled", False)),
-            "tools_enabled": bool(state.get("tools_enabled")),
             "send_as_text_file": bool(state.get("send_as_text_file")),
             "ui_model": ui_model,
         }
@@ -1398,7 +1414,6 @@ class GLMDriver(BaseDriver):
         deepthink_effort: str = "",
         enable_search: bool,
         enable_advanced_search: bool,
-        enable_tools: bool,
         send_as_text_file: bool,
         ui_model_label: str | None = None,
     ) -> Dict[str, Any]:
@@ -1411,7 +1426,6 @@ class GLMDriver(BaseDriver):
             "deepthink_effort": normalized_effort,
             "search_enabled": bool(enable_search),
             "advanced_search_enabled": bool(enable_advanced_search),
-            "tools_enabled": bool(enable_tools),
             "send_as_text_file": bool(send_as_text_file),
             "ui_model": normalized_ui_model,
         }
@@ -1423,7 +1437,6 @@ class GLMDriver(BaseDriver):
         deepthink_effort: str = "",
         enable_search: bool,
         enable_advanced_search: bool,
-        enable_tools: bool,
         ui_model_label: str | None = None,
         log_label: str = "GLM Chat: preparing new chat session...",
     ) -> None:
@@ -1433,7 +1446,6 @@ class GLMDriver(BaseDriver):
         await asyncio.sleep(self._post_delay_s)
 
         await self.apply_configured_model(model=self.current_model, wait_until_ready=True)
-        await self.set_tools_state(bool(enable_tools), model_label=ui_model_label)
         await self.set_deepthink_state(
             bool(effective_deepthink),
             effort=deepthink_effort,
@@ -1540,7 +1552,6 @@ class GLMDriver(BaseDriver):
         deepthink_effort: str = "",
         enable_search: bool,
         enable_advanced_search: bool,
-        enable_tools: bool,
         ui_model_label: str | None = None,
         auto_delete_after_send: bool = False,
     ) -> str | None:
@@ -1553,7 +1564,6 @@ class GLMDriver(BaseDriver):
             deepthink_effort=deepthink_effort,
             enable_search=enable_search,
             enable_advanced_search=enable_advanced_search,
-            enable_tools=enable_tools,
             ui_model_label=ui_model_label,
             log_label="Repetition Buster (GLM): opening throwaway chat...",
         )
@@ -1723,10 +1733,6 @@ class GLMDriver(BaseDriver):
                 return False
 
         try:
-            await self.set_tools_state(
-                bool(multi_slot_state.get("tools_enabled")),
-                model_label=str(multi_slot_state.get("ui_model") or ""),
-            )
             await self.set_deepthink_state(
                 bool(multi_slot_state.get("deepthink_enabled")),
                 effort=str(multi_slot_state.get("deepthink_effort") or ""),
@@ -2370,18 +2376,8 @@ class GLMDriver(BaseDriver):
 
     async def _find_search_button(self):
         """Find the Web Search button in the active GLM composer layout."""
-        if self._glm_tools_supported_for_model(self._get_configured_glm_model_friendly()):
-            button = await self._find_composer_toggle_button("Web search", state_attr="data-active")
-            if button:
-                return button
-            button = await self._find_composer_toggle_button("Web search", state_attr="data-selected")
-            if button:
-                return button
         return await self._find_compact_search_button()
 
-    async def _find_tools_button(self):
-        """Find the Tools button by its aria-label wrapper."""
-        return await self._find_composer_toggle_button("Tools", state_attr="data-selected")
 
     async def set_deepthink_state(
         self,
@@ -2610,34 +2606,6 @@ class GLMDriver(BaseDriver):
         except Exception as e:
             Logger.debug(f"GLM Chat: failed to verify Advanced Search state: {e}")
 
-    async def set_tools_state(self, state: bool, *, model_label: str | None = None) -> None:
-        if not self.page:
-            return
-
-        await self._dismiss_dialog_close_buttons()
-        await self._close_glm_model_dropdown()
-
-        effective_model_label = str(model_label or "").strip() or self._get_configured_glm_model_friendly()
-        supported = self._glm_tools_supported_for_model(effective_model_label)
-        wanted = bool(state) and supported
-
-        button = await self._find_tools_button()
-        if not button:
-            if wanted:
-                Logger.warning("GLM Chat: Tools button not found.")
-            return
-
-        is_enabled = await self._read_composer_toggle_enabled(
-            button,
-            state_attr="data-selected",
-            enabled_label_prefix="tools enabled",
-        )
-
-        if is_enabled == wanted:
-            return
-
-        if not await self._click_glm_control(button, label="Tools"):
-            Logger.warning("GLM Chat: failed to toggle Tools.")
 
     async def upload_file(self, file_spec: Any) -> None:
         await self._upload_file(file_spec)
@@ -3195,7 +3163,6 @@ class GLMDriver(BaseDriver):
         effective_send_deepthink = effective_settings["send_deepthink"]
         enable_search = effective_settings["search_enabled"]
         enable_advanced_search = effective_settings["advanced_search_enabled"]
-        enable_tools = effective_settings["tools_enabled"]
         send_as_text_file = effective_settings["send_as_text_file"]
         ui_model_label = str(
             effective_settings.get("model_label") or self._get_glm_model_label_for_request(resolved_model)
@@ -3224,7 +3191,6 @@ class GLMDriver(BaseDriver):
                 "send_deepthink": bool(effective_send_deepthink),
                 "search_enabled": bool(enable_search),
                 "advanced_search_enabled": bool(enable_advanced_search),
-                "tools_enabled": bool(enable_tools),
                 "send_as_text_file": bool(send_as_text_file),
             },
         )
@@ -3288,7 +3254,6 @@ class GLMDriver(BaseDriver):
                 deepthink_effort=deepthink_effort,
                 enable_search=bool(enable_search),
                 enable_advanced_search=bool(enable_advanced_search),
-                enable_tools=bool(enable_tools),
                 ui_model_label=ui_model_label,
                 auto_delete_after_send=auto_delete_enabled,
             )
@@ -3979,7 +3944,6 @@ class GLMDriver(BaseDriver):
                     "deepthink_effort": deepthink_effort,
                     "search_enabled": bool(enable_search),
                     "advanced_search_enabled": bool(enable_advanced_search),
-                    "tools_enabled": bool(enable_tools),
                     "send_as_text_file": bool(send_as_text_file),
                     "ui_model": ui_model_label,
                 }
@@ -3988,7 +3952,6 @@ class GLMDriver(BaseDriver):
                     deepthink_effort=deepthink_effort,
                     enable_search=bool(enable_search),
                     enable_advanced_search=bool(enable_advanced_search),
-                    enable_tools=bool(enable_tools),
                     send_as_text_file=bool(send_as_text_file),
                     ui_model_label=ui_model_label,
                 )
@@ -4006,7 +3969,6 @@ class GLMDriver(BaseDriver):
 
                     #  toggles must match before regenerating (GLM UI can reset them on refresh)
                     try:
-                        await self.set_tools_state(enable_tools, model_label=ui_model_label)
                         await self.set_deepthink_state(
                             effective_deepthink,
                             effort=deepthink_effort,
@@ -4076,7 +4038,6 @@ class GLMDriver(BaseDriver):
                     deepthink_effort=deepthink_effort,
                     enable_search=bool(enable_search),
                     enable_advanced_search=bool(enable_advanced_search),
-                    enable_tools=bool(enable_tools),
                     ui_model_label=ui_model_label,
                 )
 
