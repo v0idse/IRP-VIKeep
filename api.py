@@ -47,6 +47,13 @@ _TERMINAL_PARTIAL_ERROR_RE = re.compile(
 )
 
 DEFAULT_MAX_REQUEST_QUEUE_SIZE = 128
+# Background janitor that periodically inspects the request queues and clears dead entries.
+QUEUE_JANITOR_INTERVAL_SECONDS = 30.0
+# How long an already-aborted ("red") request may keep a lane busy before it is force-recovered.
+QUEUE_JANITOR_ABORT_GRACE_SECONDS = 30.0
+# Absolute safety net for a request that is still marked "processing" but went completely
+# silent (no chunks, no abort). Well above every provider-side stream timeout.
+QUEUE_JANITOR_STUCK_PROCESSING_SECONDS = 1800.0
 API_CORS_PATH_PREFIX = "/v1/"
 API_CORS_ALLOWED_METHODS = ("GET", "POST", "OPTIONS")
 API_CORS_ALLOW_METHODS_HEADER = ", ".join(API_CORS_ALLOWED_METHODS)
@@ -435,6 +442,14 @@ class QueueEntry:
     target_slot_label: Optional[str] = None
     api_key_name: Optional[str] = None
     driver_model: Optional[str] = None
+    # Set by the queue janitor the first time it sees this entry aborted, so a
+    # "red" request can be force-released after a grace period instead of
+    # blocking its lane forever.
+    aborted_at: Optional[float] = None
+    # Set when the worker actually starts handling this entry. The janitor uses it
+    # as a last-resort watchdog for a request that went completely silent while it
+    # was still the "processing" one for its lane.
+    processing_started_at: Optional[float] = None
 
 class RequestQueueFullError(Exception):
     def __init__(self, *, max_size: int, current_size: int):
@@ -613,6 +628,9 @@ class API:
                 enforce_ip_whitelist=self._enforce_ip_whitelist,
                 actions=remote_actions,
             )
+        self.worker_tasks: dict[str, asyncio.Task] = {}
+        self._queue_janitor_task: asyncio.Task | None = None
+        self._stopping = False
         self.setup_routes()
         if self.remote_control is not None:
             self.remote_control.register_routes(self.app)
@@ -2022,6 +2040,7 @@ class API:
             slot.id: asyncio.create_task(self.worker(slot.id))
             for slot in self._execution_slots
         }
+        self._start_queue_janitor()
 
     def _sync_current_entry_aliases(self) -> None:
         active_entries = list(self.current_entries_by_slot_id.values())
@@ -2029,8 +2048,217 @@ class API:
         self.current_entry = active_entries[0] if len(active_entries) == 1 else None
         self.current_abort_event = active_abort_events[0] if len(active_abort_events) == 1 else None
 
+    # ------------------------------------------------------------------
+    # Queue janitor
+    #
+    # Provider web UIs (or a disconnect racing with a provider-side error) can
+    # leave a request stuck in the queue forever. It then shows up as "red" in
+    # the Request Queue preview and, worse, keeps its lane occupied so every
+    # following request stays pending ("grey") and never runs.
+    #
+    # The janitor runs every QUEUE_JANITOR_INTERVAL_SECONDS and:
+    #   1. drops queued entries whose client already went away,
+    #   2. force-releases a lane whose "processing" entry was aborted and never
+    #      finished, and
+    #   3. as a last resort restarts a worker that went completely silent while
+    #      still holding its lane.
+    # ------------------------------------------------------------------
+    def _start_queue_janitor(self) -> None:
+        if self._dry_run_enabled:
+            return
+        if self._queue_janitor_task is not None and not self._queue_janitor_task.done():
+            return
+        self._queue_janitor_task = asyncio.create_task(self._queue_janitor_loop())
+
+    async def _queue_janitor_loop(self) -> None:
+        Logger.debug(
+            "Queue janitor started "
+            f"(interval {QUEUE_JANITOR_INTERVAL_SECONDS:.0f}s, "
+            f"abort grace {QUEUE_JANITOR_ABORT_GRACE_SECONDS:.0f}s)."
+        )
+        try:
+            while not self._stopping:
+                await asyncio.sleep(QUEUE_JANITOR_INTERVAL_SECONDS)
+                if self._stopping:
+                    return
+                try:
+                    await self._sweep_dead_queue_entries()
+                except Exception as exc:
+                    Logger.debug(f"Queue janitor sweep failed: {exc}")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            Logger.debug("Queue janitor stopped.")
+
+    async def _sweep_dead_queue_entries(self) -> None:
+        now = time.time()
+        changed = False
+
+        # 1) Queued entries whose client vanished: they can never be answered, so
+        #    drop them before a worker wastes a lane on them.
+        for slot in self._execution_slots:
+            queue = self._get_request_queue_for_slot(slot.id)
+            try:
+                queued = await queue.snapshot()
+            except Exception:
+                continue
+
+            for entry in queued:
+                if not entry.abort_event.is_set():
+                    continue
+                if entry.aborted_at is None:
+                    entry.aborted_at = now
+                    continue
+                if (now - entry.aborted_at) < QUEUE_JANITOR_ABORT_GRACE_SECONDS:
+                    continue
+
+                removed = await queue.remove_by_id(entry.id)
+                if removed is None:
+                    continue
+
+                Logger.warning(
+                    f"Queue janitor: dropping dead queued request {entry.id} "
+                    f"for {slot.label} (client gone, never processed)."
+                )
+                await self._close_entry_with_message(entry, "Request aborted.")
+                changed = True
+
+        # 2) A lane that is still marked "processing": release it if its entry was
+        #    aborted and never unwound, or if it went completely silent.
+        for slot in self._execution_slots:
+            entry = self.current_entries_by_slot_id.get(slot.id)
+            if entry is None:
+                continue
+
+            if entry.abort_event.is_set():
+                if entry.aborted_at is None:
+                    entry.aborted_at = now
+                    continue
+                if (now - entry.aborted_at) < QUEUE_JANITOR_ABORT_GRACE_SECONDS:
+                    continue
+                reason = "Request aborted."
+                log_message = (
+                    f"Queue janitor: force-releasing aborted request {entry.id} "
+                    f"on {slot.label}."
+                )
+            else:
+                started_at = entry.processing_started_at
+                if started_at is None:
+                    entry.processing_started_at = now
+                    continue
+                if (now - started_at) < QUEUE_JANITOR_STUCK_PROCESSING_SECONDS:
+                    continue
+                reason = (
+                    "Request timed out: the provider stopped responding and the "
+                    "request was released by the queue watchdog."
+                )
+                log_message = (
+                    f"Queue janitor: request {entry.id} on {slot.label} went silent for "
+                    f"{QUEUE_JANITOR_STUCK_PROCESSING_SECONDS:.0f}s; restarting the lane."
+                )
+
+            Logger.warning(log_message)
+            await self._force_release_slot(slot, entry, reason)
+            changed = True
+
+        # 3) A worker task that died (crash, unhandled exception, cancelled from
+        #    somewhere else) leaves its whole lane grey: requests pile up as
+        #    "pending" and nothing ever picks them up. Respawn it.
+        for slot in self._execution_slots:
+            task = self.worker_tasks.get(slot.id)
+            if task is not None and not task.done():
+                continue
+
+            stale_entry = self.current_entries_by_slot_id.pop(slot.id, None)
+            self.current_abort_events_by_slot_id.pop(slot.id, None)
+            self._sync_current_entry_aliases()
+
+            if stale_entry is not None:
+                Logger.warning(
+                    f"Queue janitor: worker for {slot.label} died while request "
+                    f"{stale_entry.id} was in flight; releasing the lane."
+                )
+                await self._close_entry_with_message(
+                    stale_entry,
+                    "Request aborted: the worker handling it stopped unexpectedly.",
+                )
+            else:
+                Logger.warning(
+                    f"Queue janitor: worker for {slot.label} is not running; restarting it."
+                )
+
+            self._restart_worker(slot.id)
+            changed = True
+
+        if changed:
+            self._notify_queue_state_changed()
+
+    async def _force_release_slot(
+        self,
+        slot: RuntimeExecutionSlot,
+        entry: QueueEntry,
+        reason: str,
+    ) -> None:
+        """Detach a stuck entry from its lane and make sure the lane runs again."""
+        slot_id = slot.id
+
+        try:
+            entry.abort_event.set()
+        except Exception:
+            pass
+
+        try:
+            slot.driver.request_abort()
+        except Exception:
+            pass
+
+        await self._close_entry_with_message(entry, reason)
+
+        self.current_entries_by_slot_id.pop(slot_id, None)
+        self.current_abort_events_by_slot_id.pop(slot_id, None)
+        self._sync_current_entry_aliases()
+
+        self._restart_worker(slot_id)
+
+    def _restart_worker(self, slot_id: str) -> None:
+        """Cancel a worker that may be stuck and respawn it for the same lane."""
+        old_task = self.worker_tasks.get(slot_id)
+
+        async def _respawn() -> None:
+            if old_task is not None:
+                old_task.cancel()
+                try:
+                    await old_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+
+            if self._stopping:
+                return
+
+            self.worker_tasks[slot_id] = asyncio.create_task(self.worker(slot_id))
+
+        try:
+            asyncio.create_task(_respawn())
+        except Exception as exc:
+            Logger.error(f"Queue janitor: failed to restart worker for {slot_id}: {exc}")
+
     async def stop(self):
         Logger.info("Stopping API worker...")
+        self._stopping = True
+
+        janitor_task = getattr(self, "_queue_janitor_task", None)
+        self._queue_janitor_task = None
+        if janitor_task is not None:
+            janitor_task.cancel()
+            try:
+                await janitor_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+
         for queue in self._request_queues_by_slot_id.values():
             try:
                 queue.remove_listener(self._request_queue_listener)
@@ -2092,6 +2320,7 @@ class API:
                 Logger.info("Queued request was already aborted. Skipping.")
                 return
 
+            entry.processing_started_at = time.time()
             self.current_entries_by_slot_id[slot_id] = entry
             self.current_abort_events_by_slot_id[slot_id] = abort_event
             self._sync_current_entry_aliases()
